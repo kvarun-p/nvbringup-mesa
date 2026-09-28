@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Koushick Varun <51849493+kvarun-p@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 03:01:04 +0530
+Subject: [PATCH 3/6] nak: stall divergent conditional branches for 6 cycles on
+ Turing
+
+llama.cpp's bitonic argsort shaders (argsort.comp, argsort_large.comp)
+intermittently produced wrong orders on a TU117: 55 of 1960 test cases
+over 20 runs. Bisected with temporary switches:
+  - waits on bar.sync, membar before bar.sync, and waiting on all
+    scoreboards for memory ops: no fix;
+  - 15-cycle stall on every instr, on control instrs, on branches, on
+    conditional branches, and on conditional branches in non-uniform
+    blocks: 0 failures; uniform conditional branches: no fix;
+  - minimum stall on conditional branches: 4 -> 517 failures,
+    5 -> 0, 6 -> 0.
+All register dependencies across those branches meet the SM75 latency
+tables, so this looks like a divergence timing rule. Uniform blocks are
+left alone.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/nouveau/compiler/nak/calc_instr_deps.rs | 27 +++++++++++++++++++++
+ 1 file changed, 27 insertions(+)
+
+diff --git a/src/nouveau/compiler/nak/calc_instr_deps.rs b/src/nouveau/compiler/nak/calc_instr_deps.rs
+index c89c3357..bf437664 100644
+--- a/src/nouveau/compiler/nak/calc_instr_deps.rs
++++ b/src/nouveau/compiler/nak/calc_instr_deps.rs
+@@ -1059,6 +1059,30 @@ fn calc_delays(f: &mut Function, sm: &ShaderModelInfo) -> u64 {
+     min_num_static_cycles
+ }
+ 
++/// On Turing (seen on TU117), a conditional branch that can diverge needs
++/// to stall for at least 5 cycles before the next instruction issues.
++/// With less, llama.cpp's bitonic argsort shaders intermittently produce
++/// wrong results; 4 cycles makes it worse than the default of 1.  All data
++/// dependencies around the failing branches meet the SM75 latency tables,
++/// so this is a divergence-timing rule rather than a register latency.
++/// Uniform branches are unaffected.  Use 6 for a cycle of margin.
++fn delay_divergent_branches_sm75(f: &mut Function) {
++    const MIN_DELAY: u8 = 6;
++    for b in &mut f.blocks {
++        if b.uniform {
++            continue;
++        }
++        for instr in &mut b.instrs {
++            if instr.is_branch()
++                && !instr.is_branch_always_taken()
++                && instr.deps.delay < MIN_DELAY
++            {
++                instr.deps.set_delay(MIN_DELAY);
++            }
++        }
++    }
++}
++
+ impl Shader<'_> {
+     pub fn assign_deps_serial(&mut self) {
+         for f in &mut self.functions {
+@@ -1105,6 +1129,9 @@ impl Shader<'_> {
+             for f in &mut self.functions {
+                 assign_barriers(f, self.sm);
+                 min_num_static_cycles += calc_delays(f, self.sm);
++                if self.sm.sm() == 75 {
++                    delay_divergent_branches_sm75(f);
++                }
+             }
+ 
+             if DEBUG.cycles() {

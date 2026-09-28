@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Koushick Varun <51849493+kvarun-p@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 03:11:37 +0530
+Subject: [PATCH 4/6] nvkmd/macos: 64 KiB-aligned VAs for VRAM allocations
+
+The kext now maps VRAM with 64 KiB pages where the VA and the VRAM
+address are both 64 KiB aligned (VRAM allocations of >= 64 KiB are).
+Align the VA of such allocations to match. Syncs nv_uapi.h.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/nouveau/vulkan/nvkmd/macos/nv_uapi.h         | 4 ++++
+ src/nouveau/vulkan/nvkmd/macos/nvkmd_macos_mem.c | 9 ++++++++-
+ 2 files changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/src/nouveau/vulkan/nvkmd/macos/nv_uapi.h b/src/nouveau/vulkan/nvkmd/macos/nv_uapi.h
+index 866a5289..9d3f5ce6 100755
+--- a/src/nouveau/vulkan/nvkmd/macos/nv_uapi.h
++++ b/src/nouveau/vulkan/nvkmd/macos/nv_uapi.h
+@@ -80,6 +80,10 @@ struct nvmac_info {
+ 
+ // NVMAC_VM_BIND. BIND needs [va, va + range) unbound; UNBIND may cover any part of any
+ // bindings (they are split). va, range and mem_offset are 4 KiB aligned.
++// VRAM is mapped with 64 KiB pages wherever va and the VRAM address (allocations of
++// >= 64 KiB are 64 KiB aligned) are both 64 KiB aligned for a whole 64 KiB, so bind VRAM
++// at 64 KiB-aligned VAs for speed. An UNBIND whose start or end falls inside such a page
++// fails with kIOReturnBadArgument.
+ // op: bits 7:0 NVMAC_BIND / NVMAC_UNBIND; for BIND, NVMAC_BIND_KIND(k) sets the PTE kind of
+ // this binding (otherwise the memory's allocation kind is used).
+ enum { NVMAC_BIND = 0, NVMAC_UNBIND = 1 };
+diff --git a/src/nouveau/vulkan/nvkmd/macos/nvkmd_macos_mem.c b/src/nouveau/vulkan/nvkmd/macos/nvkmd_macos_mem.c
+index 2b15a860..7594877f 100644
+--- a/src/nouveau/vulkan/nvkmd/macos/nvkmd_macos_mem.c
++++ b/src/nouveau/vulkan/nvkmd/macos/nvkmd_macos_mem.c
+@@ -63,8 +63,15 @@ nvkmd_macos_alloc_tiled_mem(struct nvkmd_dev *_dev,
+    mem->handle = handle;
+    simple_mtx_init(&mem->kmap_mutex, mtx_plain);
+ 
++   /* The kernel maps VRAM with 64 KiB pages where the VA and the VRAM address are
++    * both 64 KiB aligned; VRAM allocations of >= 64 KiB are, so align their VA too.
++    */
++   uint64_t va_align_B = align_B;
++   if (!in_gart && got >= (64 << 10))
++      va_align_B = MAX2(va_align_B, 64 << 10);
++
+    result = nvkmd_dev_alloc_va(&dev->base, log_obj, in_gart ? NVKMD_VA_GART : 0,
+-                               pte_kind, got, align_B, 0 /* fixed_addr */, &mem->base.va);
++                               pte_kind, got, va_align_B, 0 /* fixed_addr */, &mem->base.va);
+    if (result != VK_SUCCESS)
+       goto fail_mem;
+ 

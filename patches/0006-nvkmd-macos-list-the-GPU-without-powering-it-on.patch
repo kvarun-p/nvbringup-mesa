@@ -1,0 +1,156 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Koushick Varun <51849493+kvarun-p@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 17:33:15 +0530
+Subject: [PATCH 6/6] nvkmd/macos: list the GPU without powering it on
+
+NVBringup cuts the GPU off while no process has it open. Creating the
+physical device opened a full GPU connection just to read the device
+info and kept it for the VkInstance's lifetime, so any process that
+enumerated Vulkan devices (llama-server's router, for one) kept the GPU
+powered.
+
+Read the info through the kext's control client (IOServiceOpen type 2,
+NVMAC_POWER_INFO) instead: it answers from the GPU's last boot without
+powering it on, and hides the GPU when it is switched off. Only
+VkDevice creation (nvkmd_macos_dev) opens the GPU. Falls back to a full
+open before the GPU's first boot or with older kexts.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/nouveau/vulkan/nvkmd/macos/libnvmac.c     | 37 ++++++++++++++++++-
+ src/nouveau/vulkan/nvkmd/macos/libnvmac.h     |  1 +
+ src/nouveau/vulkan/nvkmd/macos/nv_uapi.h      | 19 ++++++++++
+ .../vulkan/nvkmd/macos/nvkmd_macos_pdev.c     |  8 +++-
+ 4 files changed, 63 insertions(+), 2 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvkmd/macos/libnvmac.c b/src/nouveau/vulkan/nvkmd/macos/libnvmac.c
+index d7c3deb0..7e5de990 100755
+--- a/src/nouveau/vulkan/nvkmd/macos/libnvmac.c
++++ b/src/nouveau/vulkan/nvkmd/macos/libnvmac.c
+@@ -9,6 +9,7 @@ struct nvmac_dev {
+     io_connect_t conn;
+     struct nvmac_info info;
+     const volatile uint64_t *syncs;     // read-only sync page
++    int control;                        // nvmac_open_info: control client, info only
+ };
+ 
+ int nvmac_open(nvmac_dev **out)
+@@ -45,6 +46,37 @@ int nvmac_open(nvmac_dev **out)
+     return 0;
+ }
+ 
++// Device info only, through the control client (NVMAC_CONTROL_TYPE): doesn't open the GPU, so it
++// doesn't power it on. kIOReturnNotReady before its first boot: use nvmac_open then.
++int nvmac_open_info(nvmac_dev **out)
++{
++    io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NVBringup"));
++    if (!s)
++        return kIOReturnNotFound;
++    nvmac_dev *d = calloc(1, sizeof(*d));
++    if (!d) {
++        IOObjectRelease(s);
++        return kIOReturnNoMemory;
++    }
++    kern_return_t kr = IOServiceOpen(s, mach_task_self(), NVMAC_CONTROL_TYPE, &d->conn);
++    IOObjectRelease(s);
++    if (kr) {
++        free(d);
++        return kr;
++    }
++    d->control = 1;
++    kr = nvmac_refresh_info(d);
++    if (!kr && d->info.version != NVMAC_ABI_VERSION)
++        kr = kIOReturnUnsupported;
++    if (kr) {
++        IOServiceClose(d->conn);
++        free(d);
++        return kr;
++    }
++    *out = d;
++    return 0;
++}
++
+ void nvmac_close(nvmac_dev *d)
+ {
+     if (!d)
+@@ -58,7 +90,9 @@ const struct nvmac_info *nvmac_info(nvmac_dev *d) { return &d->info; }
+ int nvmac_refresh_info(nvmac_dev *d)
+ {
+     size_t n = sizeof(d->info);
+-    return IOConnectCallStructMethod(d->conn, NVMAC_GET_INFO, NULL, 0, &d->info, &n);
++    kern_return_t kr = IOConnectCallStructMethod(d->conn, d->control ? NVMAC_POWER_INFO : NVMAC_GET_INFO,
++                                                 NULL, 0, &d->info, &n);
++    return !kr && n != sizeof(d->info) ? kIOReturnUnsupported : kr;
+ }
+ 
+ const char *nvmac_strerror(int err)
+@@ -75,6 +109,7 @@ const char *nvmac_strerror(int err)
+     case kIOReturnNoResources: return "no resources";
+     case kIOReturnNotFound: return "driver not found";
+     case kIOReturnUnsupported: return "unsupported";
++    case kIOReturnNotReady: return "not ready";
+     default: return "error";
+     }
+ }
+diff --git a/src/nouveau/vulkan/nvkmd/macos/libnvmac.h b/src/nouveau/vulkan/nvkmd/macos/libnvmac.h
+index d398b846..25452d60 100755
+--- a/src/nouveau/vulkan/nvkmd/macos/libnvmac.h
++++ b/src/nouveau/vulkan/nvkmd/macos/libnvmac.h
+@@ -14,6 +14,7 @@ extern "C" {
+ typedef struct nvmac_dev nvmac_dev;
+ 
+ int  nvmac_open(nvmac_dev **out);
++int  nvmac_open_info(nvmac_dev **out);      // info only (control client): doesn't power the GPU on
+ void nvmac_close(nvmac_dev *d);
+ const struct nvmac_info *nvmac_info(nvmac_dev *d);
+ int  nvmac_refresh_info(nvmac_dev *d);     // re-reads GET_INFO (memory usage)
+diff --git a/src/nouveau/vulkan/nvkmd/macos/nv_uapi.h b/src/nouveau/vulkan/nvkmd/macos/nv_uapi.h
+index 9d3f5ce6..86e8641a 100755
+--- a/src/nouveau/vulkan/nvkmd/macos/nv_uapi.h
++++ b/src/nouveau/vulkan/nvkmd/macos/nv_uapi.h
+@@ -16,6 +16,25 @@
+ #include <stdint.h>
+ 
+ #define NVMAC_CLIENT_TYPE   1
++// Control client (IOServiceOpen type 2): GPU power without opening the GPU, so asking doesn't wake
++// it. Same privilege as a GPU client (root or the console user).
++#define NVMAC_CONTROL_TYPE  2
++enum nvmac_control_selector {
++    NVMAC_POWER_STATUS = 0, // scalar out: state, mode, idle seconds, power-offs, power-ons, last power-on ms, connections
++    NVMAC_POWER_SET    = 1, // scalar in: mode (NVMAC_POWER_MODE_*); then as NVMAC_POWER_STATUS
++    NVMAC_POWER_INFO   = 2, // struct out: nvmac_info, without powering the GPU on: live while it runs,
++                            // else the copy from its last boot (vram_used, bar1_used 0);
++                            // kIOReturnNotReady before the first boot, kIOReturnNoDevice when
++                            // switched off. Lets Vulkan list the GPU.
++};
++#define NVMAC_POWER_STATE_ON        0
++#define NVMAC_POWER_STATE_OFF       1
++#define NVMAC_POWER_STATE_SWITCHING 2
++#define NVMAC_POWER_STATE_FAILED    3
++#define NVMAC_POWER_MODE_OFF        0   // off now and kept off (opens fail) until another mode
++#define NVMAC_POWER_MODE_ON         1   // on now and kept on
++#define NVMAC_POWER_MODE_AUTO       2   // off after the idle time without connections, on at open
++#define NVMAC_POWER_STATUS_COUNT    7
+ #define NVMAC_ABI_VERSION   1
+ 
+ enum nvmac_selector {
+diff --git a/src/nouveau/vulkan/nvkmd/macos/nvkmd_macos_pdev.c b/src/nouveau/vulkan/nvkmd/macos/nvkmd_macos_pdev.c
+index 62f67fce..97476881 100644
+--- a/src/nouveau/vulkan/nvkmd/macos/nvkmd_macos_pdev.c
++++ b/src/nouveau/vulkan/nvkmd/macos/nvkmd_macos_pdev.c
+@@ -49,8 +49,14 @@ nvkmd_macos_try_create_pdev(struct vk_object_base *log_obj,
+                             enum nvk_debug debug_flags,
+                             struct nvkmd_pdev **pdev_out)
+ {
++   /* Listing the GPU mustn't power it on (NVBringup cuts it off while unused): use the info-only
++    * control client, which answers from the GPU's last boot. Only before its first boot does this
++    * need a real open. The device (nvkmd_macos_dev) opens the GPU when a VkDevice is created.
++    */
+    nvmac_dev *nv;
+-   int err = nvmac_open(&nv);
++   int err = nvmac_open_info(&nv);
++   if (err == kIOReturnNotReady || err == kIOReturnBadArgument || err == kIOReturnUnsupported)
++      err = nvmac_open(&nv);                  /* no copy yet, or an older kext without it */
+    if (err == kIOReturnNotFound || err == kIOReturnNoDevice)
+       return VK_ERROR_INCOMPATIBLE_DRIVER;     /* no kext, or GSP-RM not running */
+    if (err == kIOReturnNotPrivileged)

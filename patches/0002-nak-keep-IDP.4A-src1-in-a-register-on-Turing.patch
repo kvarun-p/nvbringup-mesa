@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Koushick Varun <51849493+kvarun-p@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 01:40:40 +0530
+Subject: [PATCH 2/6] nak: keep IDP.4A src1 in a register on Turing
+
+MUL_MAT(iq1_m) in llama.cpp's test-backend-ops computes
+dotPacked4x8EXT(0x01010101, x); NAK legalized it to IDP.4A with an
+immediate src1 and the TU117 raised a GR exception (Xid 13).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/nouveau/compiler/nak/sm70_encode.rs | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/src/nouveau/compiler/nak/sm70_encode.rs b/src/nouveau/compiler/nak/sm70_encode.rs
+index 7e739fad..b6754ac1 100644
+--- a/src/nouveau/compiler/nak/sm70_encode.rs
++++ b/src/nouveau/compiler/nak/sm70_encode.rs
+@@ -1622,7 +1622,13 @@ impl SM70Op for OpIDp4 {
+             std::mem::swap(src_type0, src_type1);
+         }
+         b.copy_alu_src_if_not_reg(src0, gpr, SrcType::ALU);
+-        b.copy_alu_src_if_ineg_imm(src1, gpr, SrcType::I32);
++        if b.sm() < 80 {
++            // Turing (seen on TU117) raises a GR exception on IDP.4A with an
++            // immediate or constant-buffer src1; keep it in a register.
++            b.copy_alu_src_if_not_reg(src1, gpr, SrcType::ALU);
++        } else {
++            b.copy_alu_src_if_ineg_imm(src1, gpr, SrcType::I32);
++        }
+         b.copy_alu_src_if_not_reg(src2, gpr, SrcType::ALU);
+     }
+ 

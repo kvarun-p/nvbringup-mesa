@@ -1,0 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Koushick Varun <51849493+kvarun-p@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 04:44:51 +0530
+Subject: [PATCH 5/6] nvkmd/macos: mention the console-user rule in the
+ privilege error
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/nouveau/vulkan/nvkmd/macos/nvkmd_macos_pdev.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/nouveau/vulkan/nvkmd/macos/nvkmd_macos_pdev.c b/src/nouveau/vulkan/nvkmd/macos/nvkmd_macos_pdev.c
+index a877b579..62f67fce 100644
+--- a/src/nouveau/vulkan/nvkmd/macos/nvkmd_macos_pdev.c
++++ b/src/nouveau/vulkan/nvkmd/macos/nvkmd_macos_pdev.c
+@@ -55,7 +55,7 @@ nvkmd_macos_try_create_pdev(struct vk_object_base *log_obj,
+       return VK_ERROR_INCOMPATIBLE_DRIVER;     /* no kext, or GSP-RM not running */
+    if (err == kIOReturnNotPrivileged)
+       return vk_errorf(log_obj, VK_ERROR_INCOMPATIBLE_DRIVER,
+-                       "NVBringup: not privileged (run as root, or boot with nvgpu_users=1)");
++                       "NVBringup: not privileged (run as root or as the console user, or boot with nvgpu_users=1)");
+    if (err)
+       return vk_errorf(log_obj, VK_ERROR_INCOMPATIBLE_DRIVER,
+                        "NVBringup: open failed: 0x%x (%s)", err, nvmac_strerror(err));
