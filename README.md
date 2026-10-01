@@ -17,10 +17,10 @@ contain Mesa itself: you clone Mesa from its home on the
 
 | This repository | Upstream Mesa |
 |---|---|
-| branch `26.2`, tag `mesa-26.2.3` | tag [`mesa-26.2.3`](https://gitlab.freedesktop.org/mesa/mesa/-/tags/mesa-26.2.3) on branch `26.2` |
+| branch `26.2` | tag [`mesa-26.2.3`](https://gitlab.freedesktop.org/mesa/mesa/-/tags/mesa-26.2.3) on branch `26.2` |
 
-Branch and tag names follow Mesa's: branch `26.2` tracks Mesa's 26.2 stable series, and each
-tag here names the exact Mesa release its patches apply to.
+Branch names follow Mesa's: branch `26.2` tracks Mesa's 26.2 stable series. The table names the
+exact Mesa release its patches apply to, and so does `TAG` in `apply.sh`.
 
 ## What the driver does
 
@@ -153,8 +153,8 @@ git rebase --onto mesa-26.2.4 mesa-26.2.3 nvbringup-26.2
 git format-patch --no-signature --zero-commit -o /path/to/nvbringup-mesa/patches mesa-26.2.4..
 ```
 
-Then update `TAG` (and `BRANCH` for a new series) in `apply.sh`, the table at the top, and this
-repository's branch and tag.
+Then update `TAG` (and `BRANCH` for a new series) in `apply.sh` and the table at the top. A new
+Mesa series also gets a new branch in this repository.
 
 ## License
 
