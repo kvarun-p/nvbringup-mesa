@@ -43,6 +43,7 @@ tag here names the exact Mesa release its patches apply to.
 | 4 | `nvkmd/macos: 64 KiB-aligned VAs for VRAM allocations` | Some VRAM allocations can't be mapped by the kext's page tables |
 | 5 | `nvkmd/macos: mention the console-user rule in the privilege error` | A permission refusal gives an unhelpful error |
 | 6 | `nvkmd/macos: list the GPU without powering it on` | Listing Vulkan devices wakes a GPU the kext has powered off |
+| 7 | `nvkmd/macos: no host-visible VRAM; nvkmapvram for NVK's own buffers` | Apps get CPU-mapped VRAM, which the kext can't revoke, so BAR1 runs out after enough program runs; boot-arg `nvkmapvram` has no effect |
 
 Patch 1 adds `src/nouveau/vulkan/nvkmd/macos`, a backend over the kext's IOKit user client.
 It also replaces NVK's two OpenCL C helper kernels with hand-written NIR, since macOS has no

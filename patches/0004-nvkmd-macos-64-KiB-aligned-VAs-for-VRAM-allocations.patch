@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Koushick Varun <51849493+kvarun-p@users.noreply.github.com>
 Date: Mon, 28 Sep 2026 03:11:37 +0530
-Subject: [PATCH 4/6] nvkmd/macos: 64 KiB-aligned VAs for VRAM allocations
+Subject: [PATCH 4/7] nvkmd/macos: 64 KiB-aligned VAs for VRAM allocations
 
 The kext now maps VRAM with 64 KiB pages where the VA and the VRAM
 address are both 64 KiB aligned (VRAM allocations of >= 64 KiB are).

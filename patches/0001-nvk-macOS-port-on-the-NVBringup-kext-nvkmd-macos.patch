@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Koushick Varun <51849493+kvarun-p@users.noreply.github.com>
 Date: Mon, 28 Sep 2026 00:37:54 +0530
-Subject: [PATCH 1/6] nvk: macOS port on the NVBringup kext (nvkmd/macos)
+Subject: [PATCH 1/7] nvk: macOS port on the NVBringup kext (nvkmd/macos)
 
 - nvkmd/macos: nvkmd backend over libnvmac (IOKit user client of the
   NVBringup kext driving GSP-RM): memory, VA, timeline syncs, exec and

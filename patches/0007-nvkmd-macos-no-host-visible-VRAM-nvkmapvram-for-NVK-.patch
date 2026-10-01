@@ -1,0 +1,404 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Koushick Varun <51849493+kvarun-p@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 00:48:01 +0530
+Subject: [PATCH 7/7] nvkmd/macos: no host-visible VRAM; nvkmapvram for NVK's
+ own buffers
+
+A CPU mapping of VRAM (through BAR1) can't be revoked once a process has
+duplicated it, so the kext never reuses that BAR1 range and caps how much
+can be held. Offer no host-visible VRAM memory type (nor the BAR-sized
+heap) on macOS: memory the CPU maps comes from system memory.
+
+Boot-arg nvkmapvram (or NVK_MACOS_MAPVRAM for one process) puts some of
+NVK's own LOCAL|CAN_MAP buffers back in CPU-mapped VRAM, which saves the
+GPU PCIe reads per dispatch: "1"/"all", or a list of "desc" (descriptor
+pools and tables) and "cmd"/"cmd:<n>" (command chunks, at most n per
+device). They are mapped at allocation, so once the kext's cap is
+reached they come from system memory instead of failing. New
+NVKMD_MEM_USE_CMD/USE_DESC placement hints tell the backend what a
+buffer is for; other backends ignore them.
+
+llama.cpp tg, Qwen2.5 0.5B: 97 t/s none, ~101 desc, 114 all.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/nouveau/vulkan/nvk_cmd_pool.c             |  2 +-
+ src/nouveau/vulkan/nvk_descriptor_set.c       |  3 +-
+ src/nouveau/vulkan/nvk_descriptor_table.c     |  3 +-
+ src/nouveau/vulkan/nvk_physical_device.c      |  9 ++-
+ src/nouveau/vulkan/nvkmd/macos/nvkmd_macos.h  | 18 +++++
+ .../vulkan/nvkmd/macos/nvkmd_macos_mem.c      | 67 ++++++++++++++++---
+ .../vulkan/nvkmd/macos/nvkmd_macos_pdev.c     | 62 +++++++++++++++++
+ src/nouveau/vulkan/nvkmd/nvkmd.h              |  6 ++
+ 8 files changed, 157 insertions(+), 13 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_cmd_pool.c b/src/nouveau/vulkan/nvk_cmd_pool.c
+index 7297e942..9a26c7a2 100644
+--- a/src/nouveau/vulkan/nvk_cmd_pool.c
++++ b/src/nouveau/vulkan/nvk_cmd_pool.c
+@@ -22,7 +22,7 @@ nvk_cmd_mem_create(struct nvk_cmd_pool *pool, bool force_gart, struct nvk_cmd_me
+       return vk_error(pool, VK_ERROR_OUT_OF_HOST_MEMORY);
+ 
+    const uint32_t flags = force_gart ? NVKMD_MEM_GART
+-                                     : NVKMD_MEM_LOCAL;
++                                     : NVKMD_MEM_LOCAL | NVKMD_MEM_USE_CMD;
+ 
+    result = nvkmd_dev_alloc_mapped_mem(dev->nvkmd, &pool->vk.base,
+                                        NVK_CMD_MEM_SIZE, 0,
+diff --git a/src/nouveau/vulkan/nvk_descriptor_set.c b/src/nouveau/vulkan/nvk_descriptor_set.c
+index e9d95d72..e91dea78 100644
+--- a/src/nouveau/vulkan/nvk_descriptor_set.c
++++ b/src/nouveau/vulkan/nvk_descriptor_set.c
+@@ -737,7 +737,8 @@ nvk_CreateDescriptorPool(VkDevice _device,
+          }
+       } else {
+          result = nvkmd_dev_alloc_mapped_mem(dev->nvkmd, &dev->vk.base,
+-                                             mem_size, 0, NVKMD_MEM_LOCAL,
++                                             mem_size, 0,
++                                             NVKMD_MEM_LOCAL | NVKMD_MEM_USE_DESC,
+                                              NVKMD_MEM_MAP_WR, &pool->mem);
+          if (result != VK_SUCCESS) {
+             nvk_destroy_descriptor_pool(dev, pAllocator, pool);
+diff --git a/src/nouveau/vulkan/nvk_descriptor_table.c b/src/nouveau/vulkan/nvk_descriptor_table.c
+index 4bb5e1d8..5d6afd14 100644
+--- a/src/nouveau/vulkan/nvk_descriptor_table.c
++++ b/src/nouveau/vulkan/nvk_descriptor_table.c
+@@ -68,7 +68,8 @@ nvk_descriptor_table_init(struct nvk_device *dev,
+    assert(util_is_power_of_two_nonzero(min_descriptor_count));
+    assert(util_is_power_of_two_nonzero(max_descriptor_count));
+ 
+-   result = nvk_mem_arena_init(dev, &table->arena, NVKMD_MEM_LOCAL,
++   result = nvk_mem_arena_init(dev, &table->arena,
++                               NVKMD_MEM_LOCAL | NVKMD_MEM_USE_DESC,
+                                NVKMD_MEM_MAP_WR, true /* contiguous */,
+                                max_descriptor_count * descriptor_size);
+    if (result != VK_SUCCESS)
+diff --git a/src/nouveau/vulkan/nvk_physical_device.c b/src/nouveau/vulkan/nvk_physical_device.c
+index 00b10c75..7fb1201e 100644
+--- a/src/nouveau/vulkan/nvk_physical_device.c
++++ b/src/nouveau/vulkan/nvk_physical_device.c
+@@ -1596,6 +1596,7 @@ nvk_create_physical_device(struct nvk_instance *instance,
+          .flags = VK_MEMORY_HEAP_DEVICE_LOCAL_BIT,
+       };
+ 
++#if !DETECT_OS_APPLE
+       if (pdev->info.bar_size_B > 0 &&
+           pdev->info.bar_size_B < pdev->info.vram_size_B &&
+           pdev->info.cls_eng3d >= MAXWELL_A) {
+@@ -1605,6 +1606,7 @@ nvk_create_physical_device(struct nvk_instance *instance,
+             .flags = VK_MEMORY_HEAP_DEVICE_LOCAL_BIT,
+          };
+       }
++#endif
+ 
+       /* Only set available if we have the ioctl. */
+       if (nvkmd->kmd_info.has_get_vram_used)
+@@ -1615,7 +1617,12 @@ nvk_create_physical_device(struct nvk_instance *instance,
+          .heapIndex = vram_heap_idx,
+       };
+ 
+-      if (pdev->info.cls_eng3d >= MAXWELL_A) {
++      /* macOS: no host-visible VRAM. The kext can't revoke a CPU mapping of
++       * VRAM once a process has duplicated it, so it never reuses that BAR1
++       * range for anyone else and caps how much can be held. Host-visible
++       * memory comes from system memory instead (nvkmd_macos_mem.c).
++       */
++      if (pdev->info.cls_eng3d >= MAXWELL_A && !DETECT_OS_APPLE) {
+          pdev->mem_types[pdev->mem_type_count++] = (VkMemoryType) {
+             .propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+diff --git a/src/nouveau/vulkan/nvkmd/macos/nvkmd_macos.h b/src/nouveau/vulkan/nvkmd/macos/nvkmd_macos.h
+index 44b37589..1abbf74b 100644
+--- a/src/nouveau/vulkan/nvkmd/macos/nvkmd_macos.h
++++ b/src/nouveau/vulkan/nvkmd/macos/nvkmd_macos.h
+@@ -27,6 +27,12 @@
+ struct nvkmd_macos_pdev {
+    struct nvkmd_pdev base;
+    nvmac_dev *nv;                   /* queries (VRAM used) */
++   /* Boot-arg nvkmapvram: which of NVK's own LOCAL|CAN_MAP buffers go in
++    * CPU-mapped VRAM instead of system memory (NVKMD_MACOS_MAP_*), and how many
++    * command chunks per device may; see nvkmd_macos_mem.c.
++    */
++   uint32_t map_local_vram;
++   uint32_t map_cmd_max;
+    struct vk_sync_binary_type binary_type;
+    const struct vk_sync_type *sync_types[3];
+ };
+@@ -36,9 +42,14 @@ NVKMD_DECL_SUBCLASS(pdev, macos);
+ /* VA layout inside the kernel's user range: normal heap, then the capture/replay heap. */
+ #define NVKMD_MACOS_REPLAY_HEAP_SIZE (1ull << 38)
+ 
++#define NVKMD_MACOS_MAP_ALL  (1u << 0)   /* every LOCAL|CAN_MAP buffer */
++#define NVKMD_MACOS_MAP_DESC (1u << 1)   /* NVKMD_MEM_USE_DESC */
++#define NVKMD_MACOS_MAP_CMD  (1u << 2)   /* NVKMD_MEM_USE_CMD, up to map_cmd_max */
++
+ struct nvkmd_macos_dev {
+    struct nvkmd_dev base;
+    nvmac_dev *nv;
++   uint32_t map_cmd_count;          /* command chunks in CPU-mapped VRAM */
+ 
+    simple_mtx_t heap_mutex;
+    struct util_vma_heap heap;
+@@ -57,6 +68,8 @@ struct nvkmd_macos_mem {
+    uint32_t handle;
+    uint32_t kmap_count;             /* the kernel keeps one CPU mapping per memory */
+    void *kmap;
++   bool kmap_pinned;                /* mapped at allocation; kept until freed */
++   bool map_cmd;                    /* counted in dev->map_cmd_count */
+    simple_mtx_t kmap_mutex;
+ };
+ 
+@@ -128,6 +141,11 @@ VkResult nvkmd_macos_create_ctx(struct nvkmd_dev *dev,
+                                 enum nvkmd_engines engines,
+                                 struct nvkmd_ctx **ctx_out);
+ 
++/* The value of boot-arg (kern.bootargs) "name=value" ("" for a bare "name");
++ * false if it isn't there.
++ */
++bool nvkmd_macos_boot_arg(const char *name, char *value, size_t size);
++
+ /* IOReturn from libnvmac -> VkResult */
+ VkResult nvkmd_macos_result(struct vk_object_base *log_obj, int err,
+                             VkResult fallback, const char *what);
+diff --git a/src/nouveau/vulkan/nvkmd/macos/nvkmd_macos_mem.c b/src/nouveau/vulkan/nvkmd/macos/nvkmd_macos_mem.c
+index 7594877f..2f055999 100644
+--- a/src/nouveau/vulkan/nvkmd/macos/nvkmd_macos_mem.c
++++ b/src/nouveau/vulkan/nvkmd/macos/nvkmd_macos_mem.c
+@@ -7,6 +7,7 @@
+ 
+ #include "util/bitscan.h"
+ #include "util/u_math.h"
++#include "util/u_atomic.h"
+ #include "util/u_memory.h"
+ #include "vk_log.h"
+ 
+@@ -31,27 +32,68 @@ nvkmd_macos_alloc_tiled_mem(struct nvkmd_dev *_dev,
+    align_B = MAX2(align_B, pdev->bind_align_B);
+    size_B = align64(size_B, align_B);
+ 
+-   /* VRAM is CPU-visible only through the BAR1 window; system memory always is.
+-    * LOCAL prefers VRAM and falls back to system memory.
++   /* Memory the CPU maps comes from system memory: a CPU mapping of VRAM (through
++    * BAR1) can't be revoked once a process has duplicated it, so the kext holds
++    * its BAR1 range until it is reloaded, and caps how much it holds. LOCAL
++    * prefers VRAM and falls back to system memory.
++    *
++    * Boot-arg nvkmapvram puts some of NVK's own LOCAL|CAN_MAP buffers in
++    * CPU-mapped VRAM, which saves the GPU PCIe reads per dispatch and costs held
++    * BAR1 per process (llama.cpp tg, 0.5B model: 97 t/s none, ~101 desc, 114 all
++    * at ~2.6 MiB per run; 3B: 32 none, 34 all):
++    *   1 / all           every such buffer
++    *   desc              descriptor pools and tables
++    *   cmd, cmd:<n>      command chunks, at most n per device (the rest in system memory)
++    * They are mapped here, so that once the kext's cap is reached they come from
++    * system memory instead of failing.
+     */
+-   const bool want_gart = (flags & NVKMD_MEM_GART) || (pdev->debug_flags & NVK_DEBUG_FORCE_GART);
+-   const uint32_t map_flag = (flags & NVKMD_MEM_CAN_MAP) ? NVMAC_MEM_CAN_MAP : 0;
++   const struct nvkmd_macos_pdev *mpdev = nvkmd_macos_pdev(dev->base.pdev);
++   const bool force_gart = pdev->debug_flags & NVK_DEBUG_FORCE_GART;
++   bool map_vram = false, map_cmd = false;
++   if (!force_gart && (flags & NVKMD_MEM_LOCAL) && (flags & NVKMD_MEM_CAN_MAP)) {
++      if (mpdev->map_local_vram & NVKMD_MACOS_MAP_ALL)
++         map_vram = true;
++      else if ((mpdev->map_local_vram & NVKMD_MACOS_MAP_DESC) && (flags & NVKMD_MEM_USE_DESC))
++         map_vram = true;
++      else if ((mpdev->map_local_vram & NVKMD_MACOS_MAP_CMD) && (flags & NVKMD_MEM_USE_CMD)) {
++         /* Take a slot in the budget; given back if this doesn't end in VRAM. */
++         map_cmd = p_atomic_inc_return(&dev->map_cmd_count) <= mpdev->map_cmd_max;
++         if (!map_cmd)
++            p_atomic_dec(&dev->map_cmd_count);
++         map_vram = map_cmd;
++      }
++   }
++   const bool want_gart = !map_vram && ((flags & (NVKMD_MEM_GART | NVKMD_MEM_CAN_MAP)) || force_gart);
+    uint32_t handle = 0;
+    uint64_t got = 0;
++   void *kmap = NULL;
+    int err = kIOReturnNoMemory;
+    bool in_gart = want_gart;
+-   if (!want_gart)
+-      err = nvmac_mem_alloc(dev->nv, size_B, align_B, NVMAC_MEM_VRAM | map_flag, pte_kind, &handle, &got);
++   if (!want_gart) {
++      err = nvmac_mem_alloc(dev->nv, size_B, align_B, NVMAC_MEM_VRAM | (map_vram ? NVMAC_MEM_CAN_MAP : 0),
++                            pte_kind, &handle, &got);
++      if (!err && map_vram && nvmac_mem_map(dev->nv, handle, &kmap, NULL)) {
++         nvmac_mem_free(dev->nv, handle);      /* never mapped: nothing held */
++         kmap = NULL;
++         err = kIOReturnNoMemory;
++      }
++   }
+    if (err == kIOReturnNoMemory && (want_gart || (flags & NVKMD_MEM_LOCAL))) {
+       in_gart = true;
+       err = nvmac_mem_alloc(dev->nv, size_B, align_B, NVMAC_MEM_GART, pte_kind, &handle, &got);
+    }
++   if (map_cmd && (err || in_gart)) {
++      p_atomic_dec(&dev->map_cmd_count);
++      map_cmd = false;
++   }
+    if (err)
+       return nvkmd_macos_result(log_obj, err, VK_ERROR_OUT_OF_DEVICE_MEMORY, "MEM_ALLOC");
+ 
+    struct nvkmd_macos_mem *mem = CALLOC_STRUCT(nvkmd_macos_mem);
+    if (mem == NULL) {
+       nvmac_mem_free(dev->nv, handle);
++      if (map_cmd)
++         p_atomic_dec(&dev->map_cmd_count);
+       return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
+    }
+ 
+@@ -61,6 +103,9 @@ nvkmd_macos_alloc_tiled_mem(struct nvkmd_dev *_dev,
+    flags |= NVKMD_MEM_COHERENT;
+    nvkmd_mem_init(&dev->base, &mem->base, &nvkmd_macos_mem_ops, flags, got, align_B);
+    mem->handle = handle;
++   mem->kmap = kmap;
++   mem->kmap_pinned = kmap != NULL;
++   mem->map_cmd = map_cmd;
+    simple_mtx_init(&mem->kmap_mutex, mtx_plain);
+ 
+    /* The kernel maps VRAM with 64 KiB pages where the VA and the VRAM address are
+@@ -87,6 +132,8 @@ fail_va:
+ fail_mem:
+    simple_mtx_destroy(&mem->kmap_mutex);
+    nvmac_mem_free(dev->nv, handle);
++   if (map_cmd)
++      p_atomic_dec(&dev->map_cmd_count);
+    FREE(mem);
+    return result;
+ }
+@@ -111,12 +158,14 @@ nvkmd_macos_mem_free(struct nvkmd_mem *_mem)
+ 
+    nvkmd_va_free(mem->base.va);
+    nvmac_mem_free(dev->nv, mem->handle);      /* also drops the CPU mapping */
++   if (mem->map_cmd)
++      p_atomic_dec(&dev->map_cmd_count);
+    simple_mtx_destroy(&mem->kmap_mutex);
+    FREE(mem);
+ }
+ 
+ /* The kernel keeps one CPU mapping per memory object; internal and client maps
+- * share it, so it is reference counted here.
++ * share it, so it is reference counted here (a pinned one stays until freed).
+  */
+ static VkResult
+ nvkmd_macos_mem_map(struct nvkmd_mem *_mem,
+@@ -133,7 +182,7 @@ nvkmd_macos_mem_map(struct nvkmd_mem *_mem,
+ 
+    VkResult result = VK_SUCCESS;
+    simple_mtx_lock(&mem->kmap_mutex);
+-   if (mem->kmap_count == 0) {
++   if (mem->kmap == NULL) {
+       void *map = NULL;
+       int err = nvmac_mem_map(dev->nv, mem->handle, &map, NULL);
+       if (err)
+@@ -160,7 +209,7 @@ nvkmd_macos_mem_unmap(struct nvkmd_mem *_mem,
+ 
+    simple_mtx_lock(&mem->kmap_mutex);
+    assert(mem->kmap_count > 0 && map == mem->kmap);
+-   if (--mem->kmap_count == 0) {
++   if (--mem->kmap_count == 0 && !mem->kmap_pinned) {
+       nvmac_mem_unmap(dev->nv, mem->handle);
+       mem->kmap = NULL;
+    }
+diff --git a/src/nouveau/vulkan/nvkmd/macos/nvkmd_macos_pdev.c b/src/nouveau/vulkan/nvkmd/macos/nvkmd_macos_pdev.c
+index 97476881..d0ce60b1 100644
+--- a/src/nouveau/vulkan/nvkmd/macos/nvkmd_macos_pdev.c
++++ b/src/nouveau/vulkan/nvkmd/macos/nvkmd_macos_pdev.c
+@@ -7,11 +7,72 @@
+ 
+ #include "util/cache_ops.h"
+ #include "util/u_memory.h"
++#include "util/log.h"
+ #include "vk_log.h"
+ 
+ #include <IOKit/IOReturn.h>
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
++#include <sys/sysctl.h>
++
++bool
++nvkmd_macos_boot_arg(const char *name, char *value, size_t size)
++{
++   char args[1024];
++   size_t len = sizeof(args) - 1;
++   if (sysctlbyname("kern.bootargs", args, &len, NULL, 0))
++      return false;
++   args[len] = '\0';
++
++   const size_t n = strlen(name);
++   char *save;
++   for (char *tok = strtok_r(args, " \t", &save); tok; tok = strtok_r(NULL, " \t", &save)) {
++      if (strncmp(tok, name, n) || (tok[n] != '\0' && tok[n] != '='))
++         continue;
++      snprintf(value, size, "%s", tok[n] ? tok + n + 1 : "");
++      return true;
++   }
++   return false;
++}
++
++/* nvkmapvram=<list>: "1" or "all" (every LOCAL|CAN_MAP buffer), or a comma list
++ * of "desc" (descriptor pools and tables) and "cmd" or "cmd:<n>" (command chunks,
++ * at most n per device). "0" or absent: none. NVK_MACOS_MAPVRAM overrides it for
++ * one process (for measuring; the kext's cap on held BAR1 applies either way).
++ */
++static void
++parse_map_local_vram(struct nvkmd_macos_pdev *pdev)
++{
++   char v[128];
++   pdev->map_local_vram = 0;
++   pdev->map_cmd_max = UINT32_MAX;
++   const char *env = getenv("NVK_MACOS_MAPVRAM");
++   if (env)
++      snprintf(v, sizeof(v), "%s", env);
++   else if (!nvkmd_macos_boot_arg("nvkmapvram", v, sizeof(v)))
++      return;
++   if (!strcmp(v, "") || !strcmp(v, "1") || !strcmp(v, "all")) {
++      pdev->map_local_vram = NVKMD_MACOS_MAP_ALL;
++      return;
++   }
++   char *save;
++   for (char *tok = strtok_r(v, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
++      char *end = NULL;
++      unsigned long max = UINT32_MAX;
++      if (!strncmp(tok, "cmd:", 4) && tok[4])
++         max = strtoul(tok + 4, &end, 10);
++      if (!strcmp(tok, "0"))
++         continue;
++      else if (!strcmp(tok, "desc"))
++         pdev->map_local_vram |= NVKMD_MACOS_MAP_DESC;
++      else if (!strcmp(tok, "cmd") || (end && !*end && max < UINT32_MAX)) {
++         pdev->map_local_vram |= NVKMD_MACOS_MAP_CMD;
++         pdev->map_cmd_max = max;
++      } else
++         mesa_logw("NVBringup: nvkmapvram: ignoring \"%s\"", tok);
++   }
++}
+ 
+ VkResult
+ nvkmd_macos_result(struct vk_object_base *log_obj, int err, VkResult fallback, const char *what)
+@@ -124,6 +185,7 @@ nvkmd_macos_try_create_pdev(struct vk_object_base *log_obj,
+    };
+    pdev->base.bind_align_B = i->bind_align;
+    pdev->nv = nv;
++   parse_map_local_vram(pdev);
+ 
+    pdev->binary_type = vk_sync_binary_get_type(&nvkmd_macos_sync_type);
+    pdev->sync_types[0] = &nvkmd_macos_sync_type;
+diff --git a/src/nouveau/vulkan/nvkmd/nvkmd.h b/src/nouveau/vulkan/nvkmd/nvkmd.h
+index fbbd41f0..30cea23c 100644
+--- a/src/nouveau/vulkan/nvkmd/nvkmd.h
++++ b/src/nouveau/vulkan/nvkmd/nvkmd.h
+@@ -56,6 +56,12 @@ enum nvkmd_mem_flags {
+ 
+    /** This memory object has coherent CPU maps */
+    NVKMD_MEM_COHERENT   = 1 << 5,
++
++   /** Placement hints: what the memory is for.  A backend may use them to
++    * place CPU-mapped LOCAL memory (the macOS one does) or ignore them.
++    */
++   NVKMD_MEM_USE_CMD    = 1 << 6,  /**< command buffer chunks */
++   NVKMD_MEM_USE_DESC   = 1 << 7,  /**< descriptor pools and tables */
+ };
+ 
+ #define NVKMD_MEM_PLACEMENT_FLAGS \

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Koushick Varun <51849493+kvarun-p@users.noreply.github.com>
 Date: Mon, 28 Sep 2026 03:01:04 +0530
-Subject: [PATCH 3/6] nak: stall divergent conditional branches for 6 cycles on
+Subject: [PATCH 3/7] nak: stall divergent conditional branches for 6 cycles on
  Turing
 
 llama.cpp's bitonic argsort shaders (argsort.comp, argsort_large.comp)

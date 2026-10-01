@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Koushick Varun <51849493+kvarun-p@users.noreply.github.com>
 Date: Mon, 28 Sep 2026 01:40:40 +0530
-Subject: [PATCH 2/6] nak: keep IDP.4A src1 in a register on Turing
+Subject: [PATCH 2/7] nak: keep IDP.4A src1 in a register on Turing
 
 MUL_MAT(iq1_m) in llama.cpp's test-backend-ops computes
 dotPacked4x8EXT(0x01010101, x); NAK legalized it to IDP.4A with an
